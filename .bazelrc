@@ -1,0 +1,685 @@
+common --enable_platform_specific_config
+build --verbose_failures
+build --build_tag_filters=-off-by-default,-requires-container-engine
+build --//build/config:container_test_images
+# block network access by default
+build --nosandbox_default_allow_network
+test --test_tag_filters=-off-by-default,-requires-fuzzilli,-requires-container-engine
+test:asan --test_tag_filters=-off-by-default,-no-asan,-requires-fuzzilli,-requires-container-engine
+test:tsan-common --test_tag_filters=-off-by-default,-no-tsan,-requires-fuzzilli,-requires-container-engine
+# exclude enormous tests by default
+build --test_size_filters=-enormous
+# Run Python tests without snapshots while snapshot artifacts are being regenerated.
+build:regenerate-snapshots --test_size_filters=small,medium,large,enormous
+build:regenerate-snapshots --//build/config:python_snapshots=false
+# Don't run tests that set up TCP sockets in parallel since they may try to use the same ports. This
+# is less restrictive than marking such tests as "exclusive" since we can still run unrelated tests
+# at the same time.
+test --local_resources=socket=1
+# Tests that start a wptserve sidecar (wpt_test with start_server = True) are tagged
+# "resources:wptserve:1", so that at most one wptserve runs at a time.
+test --local_resources=wptserve=1
+
+# use lower test timeouts: https://bazel.build/reference/test-encyclopedia#role-test-runner
+# corresponds to small,medium,large,enormous tests (medium is default)
+build --test_timeout=3,15,60,240
+
+# TODO(cleanup): Bazel 9 sets this by default, which breaks the macOS-cross build. Fix and re-enable.
+common --@bazel_tools//tools/test:incompatible_use_default_test_toolchain=False
+
+# bazel7 enables Build without the Bytes (BwoB) by default. This significantly speeds up builds
+# using the remote cache since less data needs to be fetched.
+# Note that we use remote_download_minimal for test builds, which avoids fetching build outputs
+# where possible. While several previous BwoB bugs have been fixed, this is slower than it could be
+# due to https://github.com/bazelbuild/bazel/issues/20576.
+
+# Import CI-specific configuration. As the amount of custom configuration settings we use grows,
+# consider moving more flags out to separate files.
+import %workspace%/build/ci.bazelrc
+import %workspace%/build/rust_lint.bazelrc
+import %workspace%/build/tools/clang_tidy/clang_tidy.bazelrc
+
+# Continue building locally when remote cache entries fail to materialize
+build --incompatible_remote_local_fallback_for_remote_cache
+
+# Require custom module extensions to return metadata
+common --incompatible_require_repo_extension_metadata=root
+
+# Use -isystem for cc_library includes attribute – this prevents warnings for misbehaving external
+# code. Applies to both Linux and macOS via the shared `:unix` config (see the
+# `build:linux --config=unix` / `build:macos --config=unix` lines below).
+build:unix --features=external_include_paths --host_features=external_include_paths
+
+# Enable skip_virtual_includes feature to avoid creating redundant symlinks – safe as long as
+# sandboxing is enabled so we can use this on non-Windows systems
+build:unix --features=skip_virtual_includes --host_features=skip_virtual_includes
+
+# Enable Bazel include scanning. This parses all C++ source files to detect which headers it
+# actually includes so that the file will only be recompiled when one of those headers changes, not
+# when any header that the source files's target depends on changes. This generally results in
+# better caching/significantly fewer files needing to be recompiled when headers change.
+# This can be brittle when include paths are configured based on preprocessor macros, but should be
+# fine otherwise.
+build --cc_include_scanning
+
+# Forward compatibility with future Bazel versions:
+# Disable deprecated cfg = "host" Bazel rule setting. Blocked on perfetto.
+# common --incompatible_disable_starlark_host_transitions
+
+# Globally disable the "diabolic behavior" of implicit __init__.py creation (https://github.com/bazel-contrib/rules_python/issues/2945)
+common --incompatible_default_to_explicit_init_py
+
+# Our dependencies (ICU, zlib, etc.) produce a lot of these warnings, so we disable them.
+build --per_file_copt='external@-Wno-error'
+build --per_file_copt='external@-Wno-suggest-override'
+build --per_file_copt='external/.*v8@-Wno-unused-function'
+build --per_file_copt='external/.*com_googlesource_chromium_icu@-Wno-thread-safety-analysis'
+build --per_file_copt='external/zlib@-Wno-deprecated-non-prototype'
+build --host_per_file_copt='external/zlib@-Wno-deprecated-non-prototype'
+build --per_file_copt=external/protobuf@-Wno-deprecated-declarations,-Wno-deprecated-this-capture
+build --host_per_file_copt=external/protobuf@-Wno-deprecated-declarations,-Wno-deprecated-this-capture
+
+# opt in to capnp deprecation warnings about trying to attach to a refcounted object
+build --cxxopt=-DKJ_WARN_REFCOUNTED_ATTACH=1
+
+# TODO(cleanup): Causes warnings with LLVM20, fix and enable again
+build --copt=-Wno-nontrivial-memaccess
+
+# The macOS apple_support toolchain sets -DDEBUG for fastbuild, unlike the Linux toolchain. This is
+# unhelpful for compile speeds and test performance, and may cause compile errors based on V8 DCHECK
+# macros that reference symbols only available with V8_VERIFY_WRITE_BARRIERS (a debug-only define),
+# causing compile errors. Undefine DEBUG to match Linux behavior.
+build:macos --copt=-UDEBUG
+
+# Keep workerd and V8's Perfetto build configurations in sync.
+build:perfetto --//src/workerd/util:use_perfetto=True
+build:perfetto --@v8//:v8_use_perfetto=True
+build:no-perfetto --//src/workerd/util:use_perfetto=False
+build:no-perfetto --@v8//:v8_use_perfetto=False
+build:unix --config=perfetto
+
+# Build V8's Temporal implementation on the temporal_capi crate from crates_vendor.
+# NOTE: Temporal is still disabled at runtime for now
+build --@v8//:v8_enable_temporal_support=True
+build --@v8//:v8_temporal_capi=//deps/rust:temporal_capi
+
+# Room for every jsg::ContextDataSlot; V8 does not grow a context's embedder-data array.
+build --@v8//:v8_embedder_data_array_size=10
+
+# Increasing the optimization level of V8 significantly speeds up tests using V8 a lot, especially
+# python tests. This is useful for both CI and local development and enabled by default, but still
+# kept in a separate configuration to make it easy to disable.
+build:v8-codegen-opt --per_file_copt=v8/src@-O3
+# V8 is heavily using absl for hashing now, optimize it too.
+build:v8-codegen-opt --per_file_copt=external/abseil-cpp@-O3
+# zlib and tcmalloc (for Linux) are also CPU-intensive, optimize them too.
+build:v8-codegen-opt --per_file_copt=external/tcmalloc@-O3
+build:v8-codegen-opt --per_file_copt=external/zlib@-O3
+# BoringSSL is CPU-intensive for crypto tests, optimize it too.
+build:v8-codegen-opt --per_file_copt=external/boringssl@-O3
+# simdutf is used for fast string encoding/decoding
+build:v8-codegen-opt --per_file_copt=external/+http+simdutf@-O3
+# ICU and perfetto are generally updated with V8 and rarely need to be updated, optimize them too.
+build:v8-codegen-opt --per_file_copt=external/.*com_googlesource_chromium_icu@-O3
+build:v8-codegen-opt --per_file_copt=external/perfetto@-O3
+
+build:v8-codegen-opt-windows --per_file_copt=v8/src@/O2,/clang:-O3
+build:v8-codegen-opt-windows --per_file_copt=external/abseil-cpp@/O2,/clang:-O3
+build:v8-codegen-opt-windows --per_file_copt=external/zlib@/O2,/clang:-O3
+build:v8-codegen-opt-windows --per_file_copt=external/boringssl@/O2,/clang:-O3
+build:v8-codegen-opt-windows --per_file_copt=external/+http+simdutf@/O2,/clang:-O3
+build:v8-codegen-opt-windows --per_file_copt=external/.*com_googlesource_chromium_icu@/O2,/clang:-O3
+build:v8-codegen-opt-windows --per_file_copt=external/perfetto@/O2,/clang:-O3
+
+build:unix --config=v8-codegen-opt
+build:windows  --config=v8-codegen-opt-windows
+
+# In Google projects, exceptions are not used as a rule. Disabling them is more consistent with the
+# canonical V8 build and improves code size. Paths are adjusted for bzlmod mangling – V8 and ICU use
+# a wildcard for this as the prefix is some variation of +_repo_rules3+ where the number can change
+# when refactoring MODULE.bazel – setting this directly would be too brittle
+build:unix --per_file_copt=external/abseil-cpp@-fno-exceptions
+build:unix --per_file_copt=external/protobuf@-fno-exceptions
+build:unix --per_file_copt=external/tcmalloc@-fno-exceptions
+build:unix --per_file_copt=external/.*com_googlesource_chromium_icu@-fno-exceptions
+build:unix --per_file_copt=external/perfetto@-fno-exceptions
+build:unix --per_file_copt=external/boringssl@-fno-exceptions
+build:unix --per_file_copt=external/.*v8@-fno-exceptions
+build:unix --per_file_copt=external/ada-url@-fno-exceptions
+build:unix --per_file_copt=external/+http+simdutf@-fno-exceptions
+build:windows --per_file_copt=external/abseil-cpp@/clang:-fno-exceptions
+build:windows --per_file_copt=external/protobuf@/clang:-fno-exceptions
+build:windows --per_file_copt=external/tcmalloc@/clang:-fno-exceptions
+build:windows --per_file_copt=external/.*com_googlesource_chromium_icu@/clang:-fno-exceptions
+build:windows --per_file_copt=external/perfetto@/clang:-fno-exceptions
+build:windows --per_file_copt=external/boringssl@/clang:-fno-exceptions
+build:windows --per_file_copt=external/.*v8@/clang:-fno-exceptions
+build:windows --per_file_copt=external/ada-url@/clang:-fno-exceptions
+build:windows --per_file_copt=external/+http+simdutf@/clang:-fno-exceptions
+
+# V8 torque is an exception from this policy, see v8 BUILD.gn.
+build:unix --per_file_copt=external/.*v8/src/torque@-fexceptions
+build:windows --per_file_copt=external/.*v8/src/torque@/clang:-fexceptions
+
+# Limit transitive header includes within libc++. This improves compliance with IWYU, helps avoid
+# errors with downstream projects that implicitly define this already and reduces total include size.
+https://libcxx.llvm.org/DesignDocs/HeaderRemovalPolicy.html
+build:unix --cxxopt=-D_LIBCPP_REMOVE_TRANSITIVE_INCLUDES --host_cxxopt=-D_LIBCPP_REMOVE_TRANSITIVE_INCLUDES
+# Do not enable libc++ ABI tags. This makes mangled symbol names and thus include overhead and code
+# size slightly smaller and is safe as long as we don't link with several copies of libc++.
+build:unix --cxxopt=-D_LIBCPP_NO_ABI_TAG --host_cxxopt=-D_LIBCPP_NO_ABI_TAG
+# Disable the experimental (and currently incomplete) parallel STL implementation as with
+# downstream, this reduces the include overhead for <algorithm>.
+build:unix --cxxopt=-D_LIBCPP_HAS_NO_INCOMPLETE_PSTL --host_cxxopt=-D_LIBCPP_HAS_NO_INCOMPLETE_PSTL
+
+# V8 redefines the _WIN32_WINNT set by bazel, disable warnings for redefined macros. Since V8 uses
+# a global define for this, we need to apply it for everything.
+# TODO(cleanup): Patch upstream V8 to use local_defines for this instead.
+build:windows --copt='-Wno-macro-redefined'
+build:windows --host_copt='-Wno-macro-redefined'
+
+# typescript configuration
+# do more correct type checking
+common --@aspect_rules_ts//ts:skipLibCheck=honor_tsconfig
+# Use "tsc" as the transpiler when ts_project has no `transpiler` set.
+common --@aspect_rules_ts//ts:default_to_tsc_transpiler
+
+# optimized LTO build.
+build:thin-lto --config=opt
+build:thin-lto --copt='-flto=thin'
+build:thin-lto --linkopt='-flto=thin'
+
+# configuration used for performance profiling
+build:profile --config=thin-lto
+build:profile --copt="-fno-omit-frame-pointer" --copt="-mno-omit-leaf-frame-pointer"
+build:profile --config=limited-dbg-info
+build:profile --strip=never
+
+# configuration used for performance benchmarking is the same as profiling for consistency
+build:benchmark --config=profile
+
+# Define a debug config which is primarily intended for local development.
+build:debug -c dbg
+
+# Using simple template names saves around 5% of binary size of workerd.
+build:unix --cxxopt='-gsimple-template-names' --host_cxxopt='-gsimple-template-names'
+# Enable hidden visibility for inline functions. This can cause problems when comparing pointers to
+# inline functions across shared library boundaries, but this is unlikely to be done anywhere
+# within workerd, V8 explicitly supports hidden visibility.
+build:unix --cxxopt='-fvisibility-inlines-hidden' --host_cxxopt='-fvisibility-inlines-hidden'
+
+# Define a config mode which is fastbuild but with basic debug info.
+build:fastdbg -c fastbuild
+build:fastdbg --config=limited-dbg-info
+build:fastdbg --config=rust-debug
+build:fastdbg --strip=never
+build:fastdbg --//:dead_strip=False
+
+# provide a limited amount of debug info, sufficient for qualified stack traces.
+build:limited-dbg-info --copt='-g1' --copt="-fdebug-info-for-profiling"
+
+# Miscellaneous platform-independent options
+build --@capnp-cpp//src/kj:openssl=True --@capnp-cpp//src/kj:zlib=True --@capnp-cpp//src/kj:brotli=True
+build --@capnp-cpp//src/capnp:gen_rust=True
+# always have KJ_IREQUIRE checks enabled, this matches workers production.
+build --@capnp-cpp//src/kj:kj_enable_irequire=True
+# overriden in config=opt
+build --@capnp-cpp//src/kj:debug_memory=True
+build --cxxopt="-fbracket-depth=1024" --host_cxxopt="-fbracket-depth=1024"
+
+# Additional Rust flags (see https://doc.rust-lang.org/rustc/codegen-options/index.html)
+# Need to disable debug-assertions for fastbuild, should be off automatically for opt.
+# Using extra_rustc_flag for non-exec flags so they can be overwritten selectively.
+build --@rules_rust//:extra_rustc_flag=-Cdebug-assertions=n
+build --@rules_rust//:extra_exec_rustc_flags=-Cdebug-assertions=n
+build --@rules_rust//:rustfmt.toml=//:rustfmt.toml
+
+# We default to not enabling debug assertions and unwinding for Rust. For debug builds this is not
+# the right setting, but unfortunately we can't set that directly.
+build:rust-debug --@rules_rust//:extra_rustc_flag=-Cdebug-assertions=y
+# Use the equivalent of -g/-g2 for Rust here, this is necessary to get qualified stack traces while
+# -Zdebug-info-for-profiling is unavailable. Unlike gcc/clang, Rust defaults to -g3 otherwise.
+build:rust-debug --@rules_rust//:extra_rustc_flag=-Cdebuginfo=1
+build:rust-debug --@rules_rust//:extra_rustc_flag=-Cstrip=none
+
+# Adding -C lto=thin here would improve binary size significantly – disable it for now due to
+# compile errors and wrong code generation when bazel and rust use different LLVM versions.
+build:thin-lto --@rules_rust//:extra_rustc_flag=-Ccodegen-units=1
+
+# common sanitizers options
+build:sanitizer-common --@workerd//src/workerd/server:use_tcmalloc=False
+build:sanitizer-common --copt="-fsanitize-link-c++-runtime" --linkopt="-fsanitize-link-c++-runtime"
+build:sanitizer-common --copt="-Og"
+build:sanitizer-common --copt="-g" --strip=never
+build:sanitizer-common --copt="-fno-optimize-sibling-calls"
+build:sanitizer-common --copt="-fno-omit-frame-pointer" --copt="-mno-omit-leaf-frame-pointer"
+# Rust's sanitizer support requires nightly
+build:sanitizer-common --@rules_rust//rust/toolchain/channel:channel=nightly
+# Rust and C++ share Clang's sanitizer runtime, linked by the C++ driver.
+build:sanitizer-common --@rules_rust//:extra_rustc_flag=-Zexternal-clangrt
+
+# address sanitizer (https://github.com/google/sanitizers/wiki/AddressSanitizer)
+#
+# Instruments both C++ and Rust (nightly rustc with -Zsanitizer=address plus an ASan-built standard
+# library, see //build/rust). Supported hosts: Linux x86_64 and aarch64, macOS arm64.
+#
+# Also enables UndefinedBehaviorSanitizer for C++ (https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html).
+# Unlike ASan and TSan, UBSan can share a build with either, so it rides along here instead of
+# needing its own CI lane. It instruments C++ only: rustc has no UBSan, and safe Rust already checks
+# bounds and (in debug builds) integer overflow.
+build:asan --config=sanitizer-common
+build:asan --platforms=//build/platforms:sanitizer_address_platform
+build:asan --copt="-fsanitize=address,undefined" --linkopt="-fsanitize=address,undefined"
+build:asan --test_env=ASAN_OPTIONS=abort_on_error=true
+build:asan --test_env=UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1
+build:asan --test_env=KJ_CLEAN_SHUTDOWN=1
+# Enable ASan, LSan support in V8
+build:asan --copt="-DV8_USE_ADDRESS_SANITIZER"
+build:asan --per_file_copt='external/.*v8@-DADDRESS_SANITIZER,-DLEAK_SANITIZER'
+# One toolchain per host, plus its cargo toolchain; resolution picks the one matching the
+# (host-parented) asan platform.
+build:asan --extra_toolchains=//build/rust:asan_toolchain_linux_x86_64,//build/rust:asan_toolchain_linux_aarch64,//build/rust:asan_toolchain_macos_aarch64
+build:asan --extra_toolchains=//build/rust:asan_toolchain_linux_x86_64_cargo,//build/rust:asan_toolchain_linux_aarch64_cargo,//build/rust:asan_toolchain_macos_aarch64_cargo
+build:asan --@rules_rust//:extra_rustc_flag=-Zsanitizer=address
+
+# thread sanitizer (https://github.com/google/sanitizers/wiki/ThreadSanitizerCppManual)
+#
+# Instruments both C++ and Rust (nightly rustc with -Zsanitizer=thread plus a TSan-built standard
+# library, see //build/rust). Supported hosts: Linux x86_64 (`--config=tsan`) and macOS arm64
+# (`--config=tsan-macos`). The two differ only in the Linux-specific unwinder linkopt below --
+# bazelrc has no way to make a single flag OS-conditional, hence the two entry points sharing
+# `tsan-common`.
+build:tsan-common --config=sanitizer-common
+build:tsan-common --copt="-fsanitize=thread" --linkopt="-fsanitize=thread"
+build:tsan-common --platforms=//build/platforms:sanitizer_thread_platform
+# handle_sigabrt=0 lets death tests observe SIGABRT directly instead of routing it through TSan's
+# signal handler. history_size=7 (the maximum) keeps 10 trace parts of memory-access history per
+# thread instead of the default 3. TSan silently drops a race report when it can no longer
+# reconstruct the stack of the older access from that history, so with the default a thread that
+# gets a few milliseconds' head start on a loaded machine can race unreported; the larger history
+# makes detection robust to scheduling. Costs ~2.5MB of trace memory per live thread.
+build:tsan-common --action_env=TSAN_OPTIONS=halt_on_error=true:handle_sigabrt=0:history_size=7
+build:tsan-common --test_env=TSAN_OPTIONS=halt_on_error=true:handle_sigabrt=0:history_size=7
+# Run runtime destructors before TSan checks for thread leaks at process exit.
+build:tsan-common --test_env=KJ_CLEAN_SHUTDOWN=1
+# Clang-tidy loads this shared object into an unsanitized process, which cannot resolve TSan hooks.
+build:tsan-common --per_file_copt='tools/clang-tidy@-fno-sanitize=thread'
+# TSan significantly increases test runtime.
+build:tsan-common --test_timeout=30,150,600,2400
+# Enable V8's TSan-specific generated code and synchronization annotations. V8's Bazel build does
+# not currently derive these defines from the compiler's sanitizer flags.
+build:tsan-common --copt="-DV8_IS_TSAN"
+build:tsan-common --per_file_copt='external/.*v8@-DTHREAD_SANITIZER'
+# Perfetto also requires this define to enable its shared-memory scraping annotations.
+build:tsan-common --per_file_copt='external/.*perfetto@-DTHREAD_SANITIZER'
+# One toolchain per host, plus its cargo toolchain; resolution picks the one matching the
+# (host-parented) tsan platform.
+build:tsan-common --extra_toolchains=//build/rust:tsan_toolchain_linux_x86_64,//build/rust:tsan_toolchain_macos_aarch64
+build:tsan-common --extra_toolchains=//build/rust:tsan_toolchain_linux_x86_64_cargo,//build/rust:tsan_toolchain_macos_aarch64_cargo
+build:tsan-common --@rules_rust//:extra_rustc_flag=-Zsanitizer=thread
+
+# Linux x86_64.
+build:tsan --config=tsan-common
+
+# macOS arm64. ld64 does not accept the GNU-ld `-l:` syntax and has no equivalent need: libunwind is
+# part of libSystem and shared by every image.
+build:tsan-macos --config=tsan-common
+
+# fuzzilli (https://github.com/googleprojectzero/fuzzilli/)
+build:fuzzilli --config=asan
+build:fuzzilli --copt="-DWORKERD_FUZZILLI"
+build:fuzzilli --linkopt="-DWORKERD_FUZZILLI"
+build:fuzzilli --copt="-fsanitize-coverage=trace-pc-guard"
+build:fuzzilli --linkopt="-fsanitize-coverage=trace-pc-guard"
+build:fuzzilli --linkopt="-static-libasan"
+# Set ASan/UBSan options globally to abort on error (raise SIGABRT) for proper Fuzzilli crash detection
+build:fuzzilli --action_env=ASAN_OPTIONS=abort_on_error=1:symbolize=false
+build:fuzzilli --action_env=UBSAN_OPTIONS=abort_on_error=1:symbolize=false
+# Override test filters to include requires-fuzzilli tests (inherits asan's -no-asan filter)
+test:fuzzilli --test_tag_filters=-off-by-default
+
+#
+# Linux and macOS
+#
+build:unix --workspace_status_command=./tools/unix/workspace-status.sh
+
+build:unix --cxxopt='-std=c++23' --host_cxxopt='-std=c++23'
+build:unix --@capnp-cpp//src/kj:libdl=True
+
+# Bazel uses CC to compile C and C++ actions, no need to define CXX.
+build:unix --repo_env=BAZEL_COMPILER=clang
+build:unix --repo_env=CC=clang
+
+build:unix --test_env=LLVM_SYMBOLIZER=llvm-symbolizer
+
+# Warning options.
+build:unix --cxxopt='-Wall' --host_cxxopt='-Wall'
+build:unix --cxxopt='-Wextra' --host_cxxopt='-Wextra'
+build:unix --cxxopt='-Wunused-function' --host_cxxopt='-Wunused-function'
+build:unix --cxxopt='-Wunused-lambda-capture' --host_cxxopt='-Wunused-lambda-capture'
+build:unix --cxxopt='-Wunused-variable' --host_cxxopt='-Wunused-variable'
+build:unix --cxxopt='-Wno-sign-compare' --host_cxxopt='-Wno-sign-compare'
+build:unix --cxxopt='-Wno-unused-parameter' --host_cxxopt='-Wno-unused-parameter'
+build:unix --cxxopt='-Wno-missing-field-initializers' --host_cxxopt='-Wno-missing-field-initializers'
+build:unix --cxxopt='-Wsuggest-override'
+
+build:linux --config=unix
+build:macos --config=unix
+
+# Disable the deprecated rules_cc macOS toolchain – no need to configure this since we always use
+# the apple_support one, this will be removed in the future. See https://github.com/bazelbuild/rules_cc/issues/754
+# for context.
+build:macos --repo_env=BAZEL_USE_LEGACY_MACOS_TOOLCHAIN=0
+
+# Support macOS 13 as the minimum version. There should be at least a warning when backward
+# compatibility is broken as -Wunguarded-availability-new is enabled by default.
+build:macos --macos_minimum_os=13.5
+build:macos --host_macos_minimum_os=13.5
+
+# Avoid emitting duplicate unwind info where compact unwind info can be used. This reduces the
+# object size by ~5% on average, improving disk space usage and link times. The final binary size
+# is not affected. Note that this is on-by-default on arm64, but turning it on for all mac builds
+# is easier than adding the flag only on x86. See https://reviews.llvm.org/D122258 for detailed
+# information on the flag.
+build:macos --copt='-femit-dwarf-unwind=no-compact-unwind'
+
+# Cross-Compilation
+# Only cross-compiling on macOS from Apple Silicon to x86_64 is supported – using apple_support
+# makes this much easier than on other platforms. We could define a configuration for cross-
+# compiling from Intel Mac too, but it lacks a means to run Apple Silicon binaries. We would have to
+# change V8 mksnapshot to build in the host configuration again (effectively compiling much of V8
+# twice) and couldn't run tests, so it would provide little value.
+#
+# Define the target platform
+build:macos-cross-x86_64 --cpu=darwin_x86_64 --host_cpu=darwin_arm64 --platforms //:macOS_x86
+# Some cross-compiled tests are slower when run over Rosetta, increase the medium test size timeout.
+# Test performance is still very much satisfactory considering that emulation is being used here.
+build:macos-cross-x86_64 --test_timeout=1,30,60,240
+
+# On Linux, the toolchain is LLVM's own, over a pinned sysroot (build/deps/llvm.MODULE.bazel), and
+# nothing is taken from the host. It links libc++, libc++abi and libunwind statically, so binaries
+# depend only on glibc; macOS links with dynamic libc++, which has good backwards compatibility.
+build:linux --repo_env=BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN=1
+# rules_python's default launcher runs on the host's python3; this one runs on the hermetic
+# interpreter.
+build:linux --@rules_python//python/config_settings:bootstrap_impl=script
+
+# On Linux, enable PIC. In macos pic is the default, and the objc_library rule does not work
+# correctly if we use this flag since it will not find the object files to include
+# https://github.com/bazelbuild/bazel/issues/12439#issuecomment-914449079
+build:linux --force_pic
+
+# On Linux, garbage collection sections and optimize binary size. These do not apply to the macOS
+# toolchain.
+build:linux --linkopt="-Wl,--gc-sections"
+build:linux --copt="-ffunction-sections" --host_copt="-ffunction-sections"
+build:linux --copt="-fdata-sections" --host_copt="-fdata-sections"
+
+# Improve link performance by limiting the link stage to 8 threads – LLD link times see little if
+# any improvement beyond 8 threads (see https://reviews.llvm.org/D147493).
+build:linux --linkopt="-Wl,--threads=8"
+
+#
+# Windows
+#
+
+# See https://bazel.build/configure/windows#symlink
+startup --windows_enable_symlinks
+build:windows --workspace_status_command=./tools/windows/workspace-status.cmd
+build:windows --enable_runfiles
+# We use LLVM's MSVC-compatible compiler driver to compile our code on Windows,
+# as opposed to using MSVC directly. This enables us to use the "same" compiler
+# frontend on Linux, macOS, and Windows, massively reducing the effort required
+# to compile workerd on Windows. Notably, this provides proper support for
+# `#pragma once` when using symlinked virtual includes, `__atomic_*` functions,
+# a standards-compliant preprocessor, support for GNU statement expressions
+# used by some KJ macros, and understands the `.c++` extension by default.
+# As of bazel 7, toolchain resolution is enabled by default, so we need to define a platform for
+# the clang-cl build.
+build:windows --extra_toolchains=@local_config_cc//:cc-toolchain-x64_windows-clang-cl
+build:windows --extra_execution_platforms=//:x64_windows-clang-cl
+
+# The Windows fastbuild bazel configuration is broken in that it necessarily generates PDB debug
+# information while the Linux and macOS toolchains only compile with debug information in the dbg
+# configuration or when requested with the -g flag. This causes huge increases in compile time and
+# disk/cache space usage – a single test may come with a 490MB PDB file.
+# In an optional configuration, use the opt configuration and manually disable optimizations as a
+# workaround.
+
+build:windows_no_dbg -c opt
+build:windows_no_dbg --copt='/Od'
+build:windows_no_dbg --linkopt='/INCREMENTAL:NO'
+build:windows_no_dbg --features=-smaller_binary
+
+# Mitigate the large size impact of Windows debug binaries somewhat by applying string merging and
+# linker garbage collection.
+build:windows_dbg --config=debug
+build:windows_dbg --copt='/Gy' --copt='/Gw'
+build:windows_dbg --linkopt='/OPT:REF'
+build:windows_dbg --linkopt='/OPT:LLDTAILMERGE' --linkopt='/OPT:SAFEICF'
+
+# This hides inline symbols in classes that are marked to be exported, similar to
+# -fvisibility-inlines-hidden on Unix systems (https://blog.llvm.org/2018/11/30-faster-windows-builds-with-clang-cl_14.html)
+# Currently this only reduces object sizes slightly, larger gains are possible if we compile V8 as
+# a shared library.
+build:windows --copt='/Zc:dllexportInlines-'
+
+# Configuration for header parsing. Requires bazel toolchain support (available for macOS, Linux).
+build:parse_headers --features=parse_headers --process_headers_in_dependencies
+# Silence some capnproto warnings/errors that are not relevant for header parsing
+build:parse_headers --per_file_copt='.*\.h@-Wno-unused-function,-Wno-pragma-system-header-outside-header'
+build:parse_headers --per_file_copt=external/+http+capnp-cpp/src/kj/common.h@-Wno-unreachable-code
+build:parse_headers --per_file_copt=external/+http+capnp-cpp/src/capnp/arena.h@-DCAPNP_PRIVATE
+
+# optimized configuration
+build:opt -c opt
+build:opt --@capnp-cpp//src/kj:debug_memory=False
+
+# Release configuration.
+build:release --config=opt
+build:release --@rules_rust//:extra_rustc_flag=-Ccodegen-units=1
+
+# enable -O3 for the release configuration. Based on benchmarking there is little difference in
+# performance, but -O3 should generally be expected to be faster for at least parts of the workerd API.
+build:release_unix --copt='-O3'
+build:release_unix --config=release
+
+build:release_linux --config=release_unix
+build:release_linux --linkopt="-Wl,-O2"
+
+build:release_macos --config=release_unix
+# Disable generating LC_DATA_IN_CODE and LC_FUNCTION_STARTS binary sections, two rarely used types
+# of macOS debug info. These sections are largely undocumented, but are used by LLDB to improve
+# debugging on binaries that are otherwise stripped. There should be no need to include this
+# data in releases.
+build:release_macos --linkopt="-Wl,-no_data_in_code_info"
+build:release_macos --linkopt="-Wl,-no_function_starts"
+
+# Cross-compiled release build for x86_64.
+build:release_macos_cross_x86_64 --config=release_macos
+build:release_macos_cross_x86_64 --config=macos-cross-x86_64
+
+# On macOS, optionally compile using LLD (19 or higher is compatible with the default flags added by
+# apple_support). Requires Homebrew's lld package to be installed and symlinked into /usr/local/bin.
+# This is less CPU intensive than the system linker, but also slightly slower in terms of wall time
+# since it is less parallel. More importantly, it allows us to enable LLD's ICF pass, which
+# significantly decreases binary sizes. We could use Xcode 16's -Wl,-deduplicate option instead, but
+# LLD's ICF appears to be superior. We also want to enable ICF for Linux, but there it causes
+# warnings when dynamically linking with libc++.
+build:macos_lld --linkopt=-fuse-ld=lld --linkopt=--ld-path=/usr/local/bin/ld64.lld
+build:macos_lld_icf --config=macos_lld
+build:macos_lld_icf --linkopt="-Wl,--icf=safe"
+
+build:release_windows --config=release
+# Windows uses /O2 as its preferred optimization setting and enabled by bazel in the opt
+# configuration, but for clang-cl this is equivalent to only -O2 and a few other things. -O3 is
+# not exposed directly in the clang-cl driver, but we can access regular clang
+# flags using the /clang prefix anyway. https://clang.llvm.org/docs/UsersManual.html#the-clang-option
+build:release_windows --copt="/clang:-O3"
+# clang-cl does not enable strict aliasing by default to match MSVC's approach, unlike clang on
+# Unix which turns it on for opt builds.
+build:release_windows --copt="-fstrict-aliasing"
+# TODO(soon): Investigate these issues on an actual Windows system.
+# Compiling these files causes clang-cl 20 to crash on Windows release builds, work around this by
+# disabling inlining (using /Od would work too but we still want to have whatever optimizations we
+# can have)
+build:release_windows --per_file_copt="src/workerd/server/server"@/clang:-fno-inline
+build:release_windows --per_file_copt="src/workerd/server/container-client"@/clang:-fno-inline
+# Work around Windows test failures in rpc-related tests
+build:release_windows --per_file_copt=src/workerd/io/worker-interface@/clang:-fno-inline
+
+build:windows --cxxopt='/std:c++23preview' --host_cxxopt='/std:c++23preview'
+build:windows --copt='/D_CRT_USE_BUILTIN_OFFSETOF' --host_copt='/D_CRT_USE_BUILTIN_OFFSETOF'
+build:windows --copt='/DWIN32_LEAN_AND_MEAN' --host_copt='/DWIN32_LEAN_AND_MEAN'
+build:windows --copt='/EHs' --host_copt='/EHs'
+# The `/std:c++23preview` argument is unused during BoringSSL compilation and we don't
+# want a warning when compiling each file.
+build:windows --per_file_copt=external/boringssl@-Wno-unused-command-line-argument --host_per_file_copt=external/boringssl@-Wno-unused-command-line-argument
+
+# MSVC disappointingly sets __cplusplus to 199711L by default. Defining /Zc:__cplusplus makes it
+# set the correct value. We currently don't check __cplusplus, but some dependencies do.
+build:windows --cxxopt='/Zc:__cplusplus' --host_cxxopt='/Zc:__cplusplus'
+
+# Coverage configuration using LLVM tools. These environment variables are used by rules_cc
+# to locate LLVM coverage tools. Users should ensure llvm-profdata and llvm-cov are available
+# in PATH (create symlinks to version-specific binaries if needed, e.g., ln -s llvm-cov-22 llvm-cov).
+build:coverage --repo_env=BAZEL_USE_LLVM_NATIVE_COVERAGE=1
+# GCOV is used by rules_cc to merge raw profile data (.profraw) into indexed profile data (.profdata)
+build:coverage --repo_env=GCOV=llvm-profdata
+# COVERAGE_GCOV_PATH is used by collect_cc_coverage.sh for merging .profraw files.
+build:coverage --repo_env=COVERAGE_GCOV_PATH=/usr/bin/llvm-profdata
+# BAZEL_LLVM_COV is used by collect_cc_coverage.sh to generate LCOV reports from profile data
+build:coverage --repo_env=BAZEL_LLVM_COV=llvm-cov
+build:coverage --experimental_use_llvm_covmap
+# experimental_generate_llvm_lcov tells collect_cc_coverage to use llvm-cov export to generate LCOV
+# format instead of just outputting raw profdata. LLVM_COV specifies the llvm-cov binary to use.
+build:coverage --experimental_generate_llvm_lcov
+# kj_test and wd_test override these with the C++ toolchain's tools (build/tools/llvm), as cc_test
+# gets them; Xcode's toolchain has no llvm-cov, so on macOS they come from PATH. Without them the
+# collector skips the binary's profile.
+build:coverage --test_env=GENERATE_LLVM_LCOV=1
+build:coverage --test_env=LLVM_COV=llvm-cov
+build:coverage --test_env=LLVM_PROFDATA=llvm-profdata
+# Ensure that we fetch coverage data from remote cache
+build:coverage --experimental_fetch_all_coverage_outputs
+build:coverage --experimental_split_coverage_postprocessing
+# Allow coverage outputs to be writable for post-processing
+build:coverage --experimental_writable_outputs
+build:coverage --collect_code_coverage
+# Only instrument source code, not tests or tools - significantly speeds up coverage builds
+build:coverage --instrumentation_filter="^//src/workerd[/:],^//src/rust[/:]"
+build:coverage --instrument_test_targets
+# Disable coverage instrumentation for external dependencies to speed up compilation.
+# Coverage for V8/external code is not useful for our purposes.
+# These flags negate -fprofile-instr-generate and -fcoverage-mapping set by rules_cc.
+build:coverage --per_file_copt=external/.*@-fno-profile-instr-generate,-fno-coverage-mapping
+# KJ uses _exit() by default which bypasses atexit handlers and prevents LLVM profile runtime
+# from writing coverage data. KJ_CLEAN_SHUTDOWN forces use of normal exit() instead.
+build:coverage --test_env=KJ_CLEAN_SHUTDOWN=1
+# Use -O1 for faster compilation - coverage builds don't need heavy optimization
+build:coverage --copt=-O1
+# Reduce debug info for faster compilation and smaller binaries
+build:coverage --copt=-g1
+# Use limited coverage mode for smaller binaries and faster execution (used by Chromium)
+build:coverage --copt=-mllvm --copt=-limited-coverage-experimental=true
+coverage --test_tag_filters=-off-by-default,-requires-fuzzilli,-requires-container-engine,-lint,-benchmark,-workerd-benchmark,-no-coverage
+# Coverage instrumentation slows down test execution, so extend timeouts
+# We disable enormous tests due to the slowdown (CI jobs have a 6h max duration)
+coverage --test_size_filters=-enormous
+coverage --test_timeout=240,240,240,240
+coverage --build_tests_only
+
+# These configs are defined internally and enabled on many machines.
+# Defining them as empty just so these machines can run build commands from the workerd repo
+build:rosetta-arm64 --define=rosetta_arm64_no_op=1
+build:native-arm64 --define=native_arm64_no_op=1
+
+# Warnings that fail the build, in CI (build/ci.bazelrc) and on bazelflare.
+build:werror --copt='-Werror'
+build:werror --copt='-Wno-error=#warnings'
+build:werror --copt='-Wno-error=deprecated-declarations'
+
+#
+# Remote execution on bazelflare (Cloudflare Containers), from a macOS or Linux client. Every
+# action, host tools included, runs on Linux x86_64 executors (build/bazelflare). The credential
+# helper sends your Cloudflare Access token, opening the login in a browser the first time, or in
+# CI the job's GitHub OIDC token.
+# Only main's CI writes the cache that every client reads (bazelflare's "trusted" instance),
+# and no client can upload results of its own.
+#
+# The next line keeps external repositories (toolchains, V8, ...) in the remote cache, so a client
+# fetches only the files Bazel reads itself instead of every action input. Startup options can't be
+# scoped to a config, so it applies to every invocation, not only bazelflare's.
+startup --experimental_remote_repo_contents_cache
+#
+# The Linux build flags apply regardless of the client's OS: platform-specific configs follow the
+# client, so this config turns them off and selects :linux itself.
+#
+# CI runs these configs as they are, adding only ci-bazelflare (build/ci.bazelrc) and flags that
+# can't change an action, so a workstation's builds and CI's have the same action keys and share the
+# cache; build/check_ci_flags.sh holds CI to that. Warnings are errors, as in CI.
+#
+# The config is common, so that every command takes it, query included; each ignores the options it
+# doesn't have. The lines that expand the linux and werror configs, which only building commands
+# define, are build's. Bazel expands a config's common lines before its build lines, which none of
+# them override.
+# TODO(soon): move with the deployment to a production account.
+common:bazelflare --remote_executor=grpcs://bazelflare.workers-runtime-playground.cloudflareworkers.com:8980
+common:bazelflare --tls_certificate=build/bazelflare/ca.pem
+common:bazelflare --credential_helper=bazelflare.workers-runtime-playground.cloudflareworkers.com=%workspace%/build/bazelflare/credential-helper
+# Long enough to approve a login in the browser, which the helper opens without a saved token.
+common:bazelflare --credential_helper_timeout=2m
+common:bazelflare --noremote_upload_local_results
+common:bazelflare --noenable_platform_specific_config
+build:bazelflare --config=linux
+build:bazelflare --config=werror
+common:bazelflare --cpu=k8 --host_cpu=k8
+common:bazelflare --platforms=//build/bazelflare:linux_x86_64
+common:bazelflare --host_platform=//build/bazelflare:linux_x86_64
+common:bazelflare --extra_execution_platforms=//build/bazelflare:linux_x86_64
+# Host tools are Linux binaries, so actions don't fall back to the client, where most of them
+# couldn't run. One that could, such as a shell script's, can be allowed to run on the client with
+# --strategy=<Mnemonic>=remote,sandboxed.
+common:bazelflare --spawn_strategy=remote --remote_local_fallback=false
+# V8 marks its inspector code generator `local = 1`; it runs fine remotely.
+common:bazelflare --modify_execution_info=Genrule=-local
+# Targets that must run on the client are skipped; unlike the default filters, these keep the
+# container tests. Filters don't change action keys.
+common:bazelflare --build_tag_filters=-off-by-default,-no-remote-exec,-requires-fuzzilli
+test:bazelflare --test_tag_filters=-off-by-default,-no-remote-exec,-requires-fuzzilli
+common:bazelflare --remote_download_minimal
+common:bazelflare --remote_cache_compression --remote_timeout=600
+# bazelflare sends nothing while an action runs, so only pings notice a connection that died
+# without closing; Bazel then retries on a new one instead of waiting forever.
+common:bazelflare --grpc_keepalive_time=30s --grpc_keepalive_timeout=20s
+common:bazelflare --jobs=200
+# Bazel otherwise prepares only as many remote actions at once as the client has CPUs, and packs 100
+# streams onto each connection, each served by one bazelflare Worker invocation.
+common:bazelflare --noexperimental_throttle_remote_action_building --remote_max_concurrency_per_connection=8
+# Sanitizer builds on bazelflare, in place of --config=bazelflare: each applies its sanitizer config
+# and then bazelflare, whose platform replaces the sanitizer config's, so it restores the sanitizer
+# constraint, which selects the sanitizer-built Rust standard library. Sanitizer reports need only
+# line tables, and full debug info makes each statically linked TSan test 1.5 GB to stage.
+build:bazelflare-asan --config=asan --config=bazelflare
+build:bazelflare-asan --platforms=//build/bazelflare:linux_x86_64_asan
+build:bazelflare-asan --copt=-g1
+build:bazelflare-tsan --config=tsan --config=bazelflare
+build:bazelflare-tsan --platforms=//build/bazelflare:linux_x86_64_tsan
+build:bazelflare-tsan --copt=-g1
+# The bazelflare filters replace the sanitizer configs', so these add their -no-asan and -no-tsan
+# back.
+test:bazelflare-asan --test_tag_filters=-off-by-default,-no-asan,-no-remote-exec,-requires-network,-requires-container-engine,-requires-fuzzilli
+test:bazelflare-tsan --test_tag_filters=-off-by-default,-no-tsan,-no-remote-exec,-requires-network,-requires-container-engine,-requires-fuzzilli
+# The release build of the Linux x64 binary and the types, on bazelflare.
+build:bazelflare-release --config=release_linux --config=bazelflare --strip=always
+# `bazel coverage` on bazelflare, whose filters replace the coverage config's; this merges the two.
+# The report lands in bazel-out/_coverage/_coverage_report.dat.
+build:bazelflare-coverage --config=coverage --config=bazelflare
+coverage:bazelflare-coverage --test_tag_filters=-off-by-default,-no-coverage,-no-remote-exec,-requires-network,-requires-container-engine,-requires-fuzzilli,-lint,-benchmark,-workerd-benchmark
+# Each test collects its coverage in its own spawn: the coverage config's split post-processing adds
+# a second spawn per test, with the same inputs, and needs every coverage output fetched.
+build:bazelflare-coverage --noexperimental_split_coverage_postprocessing
+build:bazelflare-coverage --noexperimental_fetch_all_coverage_outputs
+
+# Local workstation overrides. /.local/ is gitgnored.
+try-import %workspace%/.local/bazelrc
